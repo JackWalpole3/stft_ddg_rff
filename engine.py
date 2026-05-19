@@ -91,6 +91,14 @@ def evaluate_source_domains(model: STFTDDGModel, val_loaders, device, cfg: Exper
     }
 
 
+def _stage1_best_score(val_stats: Dict, cfg: ExperimentConfig) -> float:
+    if cfg.stage1_best_metric == "mean":
+        return val_stats["acc"]
+    if cfg.stage1_best_metric == "worst":
+        return val_stats["worst_acc"]
+    raise ValueError(f"Unknown stage1_best_metric={cfg.stage1_best_metric!r}")
+
+
 def _load_identity_pretrain(model: STFTDDGModel, checkpoint_path: Path, device: torch.device) -> None:
     ckpt = torch.load(checkpoint_path, map_location=device)
     state = ckpt["model"]
@@ -420,7 +428,7 @@ def train_stage1(
     log_path = run_dir / target_rx / "logs" / "stage1_train_log.csv"
     ckpt_dir = run_dir / target_rx / "checkpoints"
     best_ckpt = ckpt_dir / "stage1_best.pt"
-    best_val_worst_acc = -1.0
+    best_stage1_score = -1.0
     patience_counter = 0
     steps = maybe_limit_steps(steps_per_epoch(train_loaders), cfg.limit_train_batches)
 
@@ -486,9 +494,10 @@ def train_stage1(
                 totals["train_count"] += int(y.numel())
 
         val_stats = evaluate_source_domains(model, val_loaders, device, cfg)
-        is_best = val_stats["worst_acc"] > best_val_worst_acc
+        selected_score = _stage1_best_score(val_stats, cfg)
+        is_best = selected_score > best_stage1_score
         if is_best:
-            best_val_worst_acc = val_stats["worst_acc"]
+            best_stage1_score = selected_score
             patience_counter = 0
             save_checkpoint(
                 best_ckpt,
@@ -497,7 +506,9 @@ def train_stage1(
                 target_rx=target_rx,
                 epoch=epoch,
                 best_val_acc=val_stats["acc"],
-                best_val_worst_acc=best_val_worst_acc,
+                best_val_worst_acc=val_stats["worst_acc"],
+                best_stage1_score=best_stage1_score,
+                stage1_best_metric=cfg.stage1_best_metric,
                 stage0_ckpt=str(stage0_ckpt),
             )
         else:
@@ -515,6 +526,8 @@ def train_stage1(
             "val_loss": val_stats["loss"],
             "val_acc": val_stats["acc"],
             "val_worst_acc": val_stats["worst_acc"],
+            "stage1_best_metric": cfg.stage1_best_metric,
+            "val_selected_score": selected_score,
             **{
                 f"val_acc_{rx.replace('-', '_')}": stats["acc"]
                 for rx, stats in val_stats["domains"].items()
@@ -530,7 +543,7 @@ def train_stage1(
             f"cls={row['loss_cls']:.4f} recon_p={row['loss_recon_p']:.4f} "
             f"recon_id={row['loss_recon_id']:.4f} train_acc={train_acc:.4f} "
             f"val_acc={val_stats['acc']:.4f} worst_val={val_stats['worst_acc']:.4f} "
-            f"best={int(is_best)}",
+            f"select_{cfg.stage1_best_metric}={selected_score:.4f} best={int(is_best)}",
             flush=True,
         )
         if patience_counter >= cfg.patience:

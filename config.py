@@ -45,8 +45,9 @@ class ExperimentConfig:
     warm_scale: float = 5e-3
 
     margin: float = 0.25
-    recon_xp_w: float = 0.1
-    recon_id_w: float = 0.1
+    recon_xp_w: float = 0.5
+    recon_id_w: float = 0.5
+    stage1_best_metric: str = "mean"
 
     limit_train_batches: int = 0
     limit_val_batches: int = 0
