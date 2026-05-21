@@ -48,6 +48,9 @@ class ExperimentConfig:
     recon_xp_w: float = 0.5
     recon_id_w: float = 0.5
     stage1_best_metric: str = "mean"
+    scl_w: float = 0.0
+    scl_temp: float = 0.07
+    arc_margin_m: float = 0.0
 
     limit_train_batches: int = 0
     limit_val_batches: int = 0

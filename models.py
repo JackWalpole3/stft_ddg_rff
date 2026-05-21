@@ -159,12 +159,18 @@ class PatchDiscriminator(nn.Module):
 
 
 class STFTDDGModel(nn.Module):
-    def __init__(self, num_classes: int = 6, z_id_dim: int = 256, z_var_channels: int = 128):
+    def __init__(
+        self,
+        num_classes: int = 6,
+        z_id_dim: int = 256,
+        z_var_channels: int = 128,
+        arc_margin_m: float = 0.0,
+    ):
         super().__init__()
         self.eid = STFTIdentityEncoder(z_dim=z_id_dim)
         self.evar = STFTVariationEncoder(out_channels=z_var_channels)
         self.generator = STFTFiLMGenerator(z_var_channels=z_var_channels, z_id_dim=z_id_dim)
-        self.classifier = ArcMarginProduct(z_id_dim, num_classes, s=10.0, m=0.0)
+        self.classifier = ArcMarginProduct(z_id_dim, num_classes, s=10.0, m=arc_margin_m)
 
     def classify(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.classifier(self.eid(x), labels)

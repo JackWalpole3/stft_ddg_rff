@@ -18,6 +18,7 @@ from .losses import (
     lsgan_discriminator_loss,
     lsgan_generator_loss,
     margin_recon_loss,
+    supcon_loss,
 )
 from .metrics import confusion_matrix_np, per_class_accuracy, save_confusion_outputs
 from .models import PatchDiscriminator, STFTDDGModel
@@ -120,7 +121,12 @@ def train_stage0_pretrain(
     cr = build_cr_datasets(target_rx, cfg, return_pos=False)
     train_loaders = make_domain_loaders(cr.source_train, cfg, shuffle=True)
     val_loaders = make_domain_loaders(cr.source_val, cfg, shuffle=False)
-    model = STFTDDGModel(cfg.num_classes, cfg.z_id_dim, cfg.z_var_channels).to(device)
+    model = STFTDDGModel(
+        cfg.num_classes,
+        cfg.z_id_dim,
+        cfg.z_var_channels,
+        arc_margin_m=cfg.arc_margin_m,
+    ).to(device)
     optimizer = torch.optim.Adam(
         list(model.eid.parameters()) + list(model.classifier.parameters()),
         lr=cfg.lr,
@@ -137,7 +143,7 @@ def train_stage0_pretrain(
     for epoch in range(1, cfg.stage0_pretrain_epochs + 1):
         model.train()
         loader_iters = [iter(loader) for _, loader in train_loaders]
-        totals = {"loss": 0.0, "correct": 0, "count": 0}
+        totals = {"loss": 0.0, "loss_scl": 0.0, "correct": 0, "count": 0}
         start_time = time.time()
         for _ in range(steps):
             xs = []
@@ -154,13 +160,17 @@ def train_stage0_pretrain(
             x_all = torch.cat(xs, dim=0)
             y_all = torch.cat(ys, dim=0)
             optimizer.zero_grad(set_to_none=True)
-            logits = model.classify(x_all, y_all)
-            loss = F.cross_entropy(logits, y_all)
+            z_id = model.eid(x_all)
+            logits = model.classifier(z_id, y_all)
+            loss_cls = F.cross_entropy(logits, y_all)
+            loss_scl = supcon_loss(z_id, y_all, cfg.scl_temp)
+            loss = loss_cls + cfg.scl_w * loss_scl
             loss.backward()
             optimizer.step()
 
             pred = logits.argmax(dim=1)
             totals["loss"] += float(loss.item())
+            totals["loss_scl"] += float(loss_scl.item())
             totals["correct"] += int((pred == y_all).sum().item())
             totals["count"] += int(y_all.numel())
 
@@ -185,6 +195,7 @@ def train_stage0_pretrain(
             "target_rx": target_rx,
             "epoch": epoch,
             "train_loss": totals["loss"] / max(steps, 1),
+            "train_loss_scl": totals["loss_scl"] / max(steps, 1),
             "train_acc": train_acc,
             "val_loss": val_stats["loss"],
             "val_acc": val_stats["acc"],
@@ -247,7 +258,12 @@ def train_stage0(
     cr = build_cr_datasets(target_rx, cfg, return_pos=False)
     train_loaders = make_domain_loaders(cr.source_train, cfg, shuffle=True)
     val_loaders = make_domain_loaders(cr.source_val, cfg, shuffle=False)
-    model = STFTDDGModel(cfg.num_classes, cfg.z_id_dim, cfg.z_var_channels).to(device)
+    model = STFTDDGModel(
+        cfg.num_classes,
+        cfg.z_id_dim,
+        cfg.z_var_channels,
+        arc_margin_m=cfg.arc_margin_m,
+    ).to(device)
     _load_identity_pretrain(model, identity_ckpt, device)
     disc = PatchDiscriminator().to(device)
     _set_requires_grad(model.eid, False)
@@ -417,7 +433,12 @@ def train_stage1(
     train_loaders = make_domain_loaders(cr.source_train, cfg, shuffle=True)
     val_loaders = make_domain_loaders(cr.source_val, cfg, shuffle=False)
 
-    model = STFTDDGModel(cfg.num_classes, cfg.z_id_dim, cfg.z_var_channels).to(device)
+    model = STFTDDGModel(
+        cfg.num_classes,
+        cfg.z_id_dim,
+        cfg.z_var_channels,
+        arc_margin_m=cfg.arc_margin_m,
+    ).to(device)
     _load_stage0(model, stage0_ckpt, device)
     pretrain_model = copy.deepcopy(model).to(device)
     pretrain_model.eval()
@@ -440,6 +461,7 @@ def train_stage1(
             "loss_cls": 0.0,
             "loss_recon_p": 0.0,
             "loss_recon_id": 0.0,
+            "loss_scl": 0.0,
             "train_correct": 0,
             "train_count": 0,
         }
@@ -457,12 +479,12 @@ def train_stage1(
                 x_ab = pretrain_model.generator(s_a_pre, f_b_pre)
 
             optimizer.zero_grad(set_to_none=True)
-            s_a, _ = model.encode_pair(x_a)
-            s_b, _ = model.encode_pair(x_b)
-            _, fp_a = model.encode_pair(pos_a)
-            _, fp_b = model.encode_pair(pos_b)
-            x_a_recon_p = model.generator(s_a, fp_a)
-            x_b_recon_p = model.generator(s_b, fp_b)
+            s_a, z_a = model.encode_pair(x_a)
+            s_b, z_b = model.encode_pair(x_b)
+            _, z_pa = model.encode_pair(pos_a)
+            _, z_pb = model.encode_pair(pos_b)
+            x_a_recon_p = model.generator(s_a, z_pa)
+            x_b_recon_p = model.generator(s_b, z_pb)
 
             logits_a = model.classify(x_a, y_a)
             logits_b = model.classify(x_b, y_b)
@@ -480,7 +502,15 @@ def train_stage1(
             logits_ba = model.classify(x_ba, y_a)
             logits_ab = model.classify(x_ab, y_b)
             loss_recon_id = F.cross_entropy(logits_ba, y_a) + F.cross_entropy(logits_ab, y_b)
-            loss_total = loss_cls + cfg.recon_xp_w * loss_recon_p + cfg.recon_id_w * loss_recon_id
+            z_all = torch.cat([z_a, z_b, z_pa, z_pb], dim=0)
+            y_all = torch.cat([y_a, y_b, y_a, y_b], dim=0)
+            loss_scl = supcon_loss(z_all, y_all, cfg.scl_temp)
+            loss_total = (
+                loss_cls
+                + cfg.recon_xp_w * loss_recon_p
+                + cfg.recon_id_w * loss_recon_id
+                + cfg.scl_w * loss_scl
+            )
             loss_total.backward()
             optimizer.step()
 
@@ -488,6 +518,7 @@ def train_stage1(
             totals["loss_cls"] += float(loss_cls.item())
             totals["loss_recon_p"] += float(loss_recon_p.item())
             totals["loss_recon_id"] += float(loss_recon_id.item())
+            totals["loss_scl"] += float(loss_scl.item())
             for logits, y in ((logits_a, y_a), (logits_b, y_b)):
                 pred = logits.argmax(dim=1)
                 totals["train_correct"] += int((pred == y).sum().item())
@@ -522,6 +553,7 @@ def train_stage1(
             "loss_cls": totals["loss_cls"] / max(steps, 1),
             "loss_recon_p": totals["loss_recon_p"] / max(steps, 1),
             "loss_recon_id": totals["loss_recon_id"] / max(steps, 1),
+            "loss_scl": totals["loss_scl"] / max(steps, 1),
             "train_acc": train_acc,
             "val_loss": val_stats["loss"],
             "val_acc": val_stats["acc"],
@@ -562,7 +594,12 @@ def test_target(
 ) -> Dict:
     cr = build_cr_datasets(target_rx, cfg, return_pos=False)
     test_loader = make_loader(cr.target_test, cfg, shuffle=False)
-    model = STFTDDGModel(cfg.num_classes, cfg.z_id_dim, cfg.z_var_channels).to(device)
+    model = STFTDDGModel(
+        cfg.num_classes,
+        cfg.z_id_dim,
+        cfg.z_var_channels,
+        arc_margin_m=cfg.arc_margin_m,
+    ).to(device)
     ckpt = torch.load(stage1_ckpt, map_location=device)
     model.load_state_dict(ckpt["model"])
     stats = evaluate_classifier(model, [test_loader], device, cfg.num_classes)
